@@ -3,6 +3,10 @@
 Автономное Android-приложение для переназначения кнопок на рулевом колесе в совместимом головном устройстве автомобиля Haval M6. 
 Фоновая служба (foreground service) отслеживает пакеты данных от MCU (микроконтроллера управления) и применяет фильтр штатной службы обработки нажатий клавиш.
 
+> [!CAUTION]
+>Приложение разработано для бесплатного распростарнения.
+>Коммерческое использование и платная установка запрещена!
+
 Standalone Android application for remapping steering-wheel buttons on a compatible
 Haval M6 head unit. The foreground service subscribes to MCU button packets and applies the OEM
 key-service filter.
