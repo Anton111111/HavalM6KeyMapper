@@ -8,7 +8,7 @@ val platformPk8 = providers.gradleProperty("platformPk8")
 val defaultPlatformPk8 = rootProject.file("signing/platform.pk8")
 val androidSdkRoot = providers.environmentVariable("ANDROID_SDK_ROOT")
     .orElse(providers.environmentVariable("ANDROID_HOME"))
-val appVersionName = "1.0"
+val appVersionName = "1.1"
 
 fun resolvePlatformPk8Path(): String {
     platformPk8.orNull?.let { return it }
@@ -26,7 +26,7 @@ android {
         applicationId = "com.anton111111.haval.m6.keymapper"
         minSdk = 28
         targetSdk = 28
-        versionCode = 1
+        versionCode = 2
         versionName = appVersionName
     }
 
