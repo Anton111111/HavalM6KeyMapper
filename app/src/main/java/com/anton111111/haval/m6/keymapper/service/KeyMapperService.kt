@@ -289,6 +289,12 @@ class KeyMapperService : Service() {
         val signature = "DISABLE:" + whitelist.sorted().joinToString("|")
         if (lastAppliedSignature == signature && filterApplied && !recoveryPending()) return
         applyWithRetry(signature, reason) { activeBinder ->
+            val signatureChanged = lastAppliedSignature != signature
+            if (signatureChanged && (filterApplied || recoveryPending())) {
+                KeyServiceClient.restore(activeBinder)
+                filterApplied = false
+                clearRecoveryPending()
+            }
             persistRecoveryPending()
             KeyServiceClient.disable(activeBinder, whitelist)
             filterApplied = true
