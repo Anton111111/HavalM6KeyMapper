@@ -52,6 +52,14 @@ class KeyMapperService : Service() {
     private val presses = mutableMapOf<Int, PressState>()
     private val pulses = mutableMapOf<String, ScheduledFuture<*>>()
     private val climateClient = HvacClient()
+    private val applyLock = Any()
+    private var pendingApply: ScheduledFuture<*>? = null
+    private var healthCheckTask: ScheduledFuture<*>? = null
+    @Volatile private var applyInFlight = false
+    @Volatile private var applyQueued = false
+    @Volatile private var lastAppliedSignature: String? = null
+    @Volatile private var applyRetryAttempt = 0
+
 
     private val mcuCallback = object : IMcuCommCallback {
         override fun mcuCommCallback(data: ByteArray?, length: Char) {
@@ -68,7 +76,7 @@ class KeyMapperService : Service() {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             keyServiceBinder = service
             setStatus("OEM-служба кнопок подключена; ожидание MCU и настроек")
-            applyCurrentConfiguration()
+            applyCurrentConfiguration(APPLY_DEBOUNCE_AFTER_REBIND_MS, "service connected")
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -102,9 +110,10 @@ class KeyMapperService : Service() {
         scope.launch {
             store.settings.collect { newSettings ->
                 settings = newSettings
-                applyCurrentConfiguration()
+                applyCurrentConfiguration(APPLY_DEBOUNCE_SETTINGS_MS, "settings changed")
             }
         }
+        startHealthCheckLoop()
         worker.execute {
             try {
                 catalog = OemKeyCatalogLoader.load(this)
@@ -121,7 +130,7 @@ class KeyMapperService : Service() {
                 setStatus("MCU недоступен: ${exception.message}")
             }
             handler.post { rebindKeyService() }
-            applyCurrentConfiguration()
+            applyCurrentConfiguration(APPLY_DEBOUNCE_AFTER_BOOT_MS, "startup")
         }
     }
 
@@ -132,7 +141,7 @@ class KeyMapperService : Service() {
                 scope.launch { store.setServiceEnabled(false) }
                 restorePending = true
                 rebindKeyService()
-                applyCurrentConfiguration()
+                applyCurrentConfiguration(0, "restore command")
             }
             else -> rebindKeyService()
         }
@@ -143,6 +152,12 @@ class KeyMapperService : Service() {
 
     override fun onDestroy() {
         scope.cancel()
+        synchronized(applyLock) {
+            pendingApply?.cancel(false)
+            pendingApply = null
+            healthCheckTask?.cancel(false)
+            healthCheckTask = null
+        }
         worker.execute {
             if (filterApplied) {
                 runCatching { keyServiceBinder?.let(KeyServiceClient::restore) }
@@ -190,58 +205,161 @@ class KeyMapperService : Service() {
         }
     }
 
-    private fun applyCurrentConfiguration() {
+    private fun applyCurrentConfiguration(delayMs: Long = 0L, reason: String = "update") {
+        synchronized(applyLock) {
+            pendingApply?.cancel(false)
+            pendingApply = worker.schedule({ runApply(reason) }, delayMs, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    private fun runApply(reason: String) {
+        synchronized(applyLock) {
+            if (applyInFlight) {
+                applyQueued = true
+                return
+            }
+            applyInFlight = true
+        }
+        var runQueued = false
+        try {
+            executeApply(reason)
+        } finally {
+            synchronized(applyLock) {
+                applyInFlight = false
+                if (applyQueued) {
+                    applyQueued = false
+                    runQueued = true
+                }
+            }
+            if (runQueued) applyCurrentConfiguration(0, "queued")
+        }
+    }
+
+    private fun executeApply(reason: String) {
         val currentCatalog = catalog
-        val binder = keyServiceBinder
-        if (binder == null) return
-        worker.execute {
+        val shouldRestore = restorePending || !settings.serviceEnabled ||
+            (recoveryPending() && (!mcuReady || currentCatalog == null))
+
+        if (shouldRestore) {
+            val signature = "RESTORE"
+            if (lastAppliedSignature == signature && !restorePending) return
+            applyWithRetry(signature, reason) { activeBinder ->
+                if (filterApplied || recoveryPending()) {
+                    KeyServiceClient.restore(activeBinder)
+                    filterApplied = false
+                    clearRecoveryPending()
+                    setStatus("Штатная обработка OEM-кнопок восстановлена")
+                } else {
+                    setStatus(if (settings.serviceEnabled) "Ожидание MCU" else "Переназначение выключено")
+                }
+                restorePending = false
+                if (stopAfterRestore) {
+                    stopAfterRestore = false
+                    stopSelf()
+                }
+            }
+            return
+        }
+
+        if (currentCatalog == null) {
+            setStatus("OEM-конфигурация кнопок недоступна")
+            return
+        }
+        if (!mcuReady) {
+            setStatus("Переназначение не включено: поток MCU недоступен; OEM-кнопки восстановлены")
+            return
+        }
+
+        val rules = settings.rules.values.filter(ButtonRule::overridesStock)
+        if (rules.isEmpty()) {
+            val signature = "RESTORE"
+            if (lastAppliedSignature == signature && !recoveryPending()) return
+            applyWithRetry(signature, reason) { activeBinder ->
+                if (filterApplied || recoveryPending()) {
+                    KeyServiceClient.restore(activeBinder)
+                    filterApplied = false
+                    clearRecoveryPending()
+                }
+                setStatus("Служба активна; переопределённых кнопок пока нет")
+            }
+            return
+        }
+
+        val whitelist = KeyServiceClient.whitelist(currentCatalog, settings)
+        val signature = "DISABLE:" + whitelist.sorted().joinToString("|")
+        if (lastAppliedSignature == signature && filterApplied && !recoveryPending()) return
+        applyWithRetry(signature, reason) { activeBinder ->
+            persistRecoveryPending()
+            KeyServiceClient.disable(activeBinder, whitelist)
+            filterApplied = true
+            setStatus("Переназначение активно; фильтруется кнопок: "+rules.size)
+        }
+    }
+
+    private fun applyWithRetry(signature: String, reason: String, action: (IBinder) -> Unit) {
+        val delays = APPLY_RETRY_BACKOFF_MS
+        var attempt = 0
+        while (true) {
+            val activeBinder = keyServiceBinder
+            if (activeBinder == null) {
+                rebindKeyService()
+                val delay = delays[minOf(attempt, delays.lastIndex)]
+                applyRetryAttempt = attempt + 1
+                applyCurrentConfiguration(delay, "binder missing retry")
+                return
+            }
             try {
-                val mustRestore = restorePending || !settings.serviceEnabled ||
-                    (recoveryPending() && (!mcuReady || currentCatalog == null))
-                if (mustRestore) {
-                    if (filterApplied || recoveryPending()) {
-                        KeyServiceClient.restore(binder)
-                        filterApplied = false
-                        clearRecoveryPending()
-                        setStatus("Штатная обработка OEM-кнопок восстановлена")
-                    } else {
-                        setStatus(if (settings.serviceEnabled) "Ожидание MCU" else "Переназначение выключено")
-                    }
-                    restorePending = false
-                    if (stopAfterRestore) {
-                        stopAfterRestore = false
-                        stopSelf()
-                    }
-                    return@execute
-                }
-                if (currentCatalog == null) {
-                    setStatus("OEM-конфигурация кнопок недоступна")
-                    return@execute
-                }
-                if (!mcuReady) {
-                    setStatus("Переназначение не включено: поток MCU недоступен; OEM-кнопки восстановлены")
-                    return@execute
-                }
-                val rules = settings.rules.values.filter(ButtonRule::overridesStock)
-                if (rules.isEmpty()) {
-                    if (filterApplied || recoveryPending()) {
-                        KeyServiceClient.restore(binder)
-                        filterApplied = false
-                        clearRecoveryPending()
-                    }
-                    setStatus("Служба активна; переопределённых кнопок пока нет")
-                    return@execute
-                }
-                val whitelist = KeyServiceClient.whitelist(currentCatalog, settings)
-                persistRecoveryPending()
-                KeyServiceClient.disable(binder, whitelist)
-                filterApplied = true
-                setStatus("Переназначение активно; фильтруется кнопок: ${rules.size}")
+                action(activeBinder)
+                lastAppliedSignature = signature
+                applyRetryAttempt = 0
+                return
             } catch (exception: Throwable) {
                 Log.e(TAG, "Failed applying OEM key filter", exception)
                 rememberFailure("Ошибка применения фильтра OEM-кнопок", exception)
-                setStatus("Ошибка применения фильтра; восстановление требуется: ${exception.message}")
+                if (attempt >= MAX_APPLY_RETRIES - 1) {
+                    applyRetryAttempt = 0
+                    runCatching {
+                        keyServiceBinder?.let(KeyServiceClient::restore)
+                        filterApplied = false
+                        if (recoveryPending()) clearRecoveryPending()
+                    }
+                    setStatus("Ошибка применения фильтра; включён fail-safe")
+                    forceRebindKeyService()
+                    applyCurrentConfiguration(HEALTH_CHECK_INTERVAL_MS, "fail-safe")
+                    return
+                }
+                val delay = delays[minOf(attempt, delays.lastIndex)]
+                attempt += 1
+                applyRetryAttempt = attempt
+                setStatus("Ошибка применения фильтра; повтор через "+delay+"мс")
+                forceRebindKeyService()
+                applyCurrentConfiguration(delay, "retry "+attempt)
+                return
             }
+        }
+    }
+
+    private fun forceRebindKeyService() {
+        handler.post {
+            if (bound) {
+                runCatching { unbindService(keyConnection) }
+                    .onFailure { Log.e(TAG, "Failed unbinding OEM key service during rebind", it) }
+                bound = false
+            }
+            keyServiceBinder = null
+            filterApplied = false
+            rebindKeyService()
+        }
+    }
+
+    private fun startHealthCheckLoop() {
+        synchronized(applyLock) {
+            healthCheckTask?.cancel(false)
+            healthCheckTask = worker.scheduleAtFixedRate({
+                if (settings.serviceEnabled || recoveryPending() || restorePending || applyRetryAttempt > 0) {
+                    applyCurrentConfiguration(0, "health-check")
+                }
+            }, HEALTH_CHECK_INITIAL_DELAY_MS, HEALTH_CHECK_INTERVAL_MS, TimeUnit.MILLISECONDS)
         }
     }
 
@@ -521,5 +639,12 @@ class KeyMapperService : Service() {
         private const val RECOVERY_PENDING = "oem_filter_recovery_pending"
         private const val LONG_PRESS_MS = 800L
         private const val HVAC_PULSE_MS = 300L
+        private const val APPLY_DEBOUNCE_AFTER_BOOT_MS = 1_500L
+        private const val APPLY_DEBOUNCE_AFTER_REBIND_MS = 1_000L
+        private const val APPLY_DEBOUNCE_SETTINGS_MS = 150L
+        private const val HEALTH_CHECK_INITIAL_DELAY_MS = 3_000L
+        private const val HEALTH_CHECK_INTERVAL_MS = 5_000L
+        private const val MAX_APPLY_RETRIES = 4
+        private val APPLY_RETRY_BACKOFF_MS = longArrayOf(200L, 500L, 1_000L, 2_000L)
     }
 }
