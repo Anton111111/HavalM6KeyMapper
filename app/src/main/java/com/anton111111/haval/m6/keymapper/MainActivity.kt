@@ -145,6 +145,14 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private val HIDDEN_ACTIONS = setOf(
+    KeyAction.MEDIA_NEXT,
+    KeyAction.MEDIA_PREVIOUS,
+    KeyAction.MEDIA_PLAY_PAUSE,
+)
+
+private val VISIBLE_ACTIONS = KeyAction.entries.filterNot { it in HIDDEN_ACTIONS }
+
 @Composable
 private fun KeyMapperScreen(viewModel: KeyMapperViewModel) {
     val state by viewModel.state.collectAsState()
@@ -593,7 +601,7 @@ private fun RowScope.ActionDropdown(
             }
         }
         DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-            KeyAction.entries.forEach { action ->
+            VISIBLE_ACTIONS.forEach { action ->
                 DropdownMenuItem(
                     text = { Text(action.title) },
                     onClick = {
