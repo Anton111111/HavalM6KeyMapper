@@ -1,9 +1,7 @@
 package com.anton111111.haval.m6.keymapper
 
-import android.app.AppOpsManager
 import android.content.Intent
 import android.os.Bundle
-import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.LocalActivity
 import androidx.activity.compose.setContent
@@ -60,9 +58,6 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.anton111111.haval.m6.keymapper.data.ButtonDefinition
 import com.anton111111.haval.m6.keymapper.data.ButtonRule
@@ -148,20 +143,6 @@ class MainActivity : ComponentActivity() {
         }
         startActivity(Intent.createChooser(share, "Поделиться логом сервиса"))
     }
-
-    fun hasUsageStatsAccess(): Boolean {
-        val appOps = getSystemService(APP_OPS_SERVICE) as? AppOpsManager ?: return false
-        val mode = appOps.checkOpNoThrow(
-            AppOpsManager.OPSTR_GET_USAGE_STATS,
-            android.os.Process.myUid(),
-            packageName,
-        )
-        return mode == AppOpsManager.MODE_ALLOWED
-    }
-
-    fun openUsageAccessSettings() {
-        startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-    }
 }
 
 @Composable
@@ -169,21 +150,9 @@ private fun KeyMapperScreen(viewModel: KeyMapperViewModel) {
     val state by viewModel.state.collectAsState()
     val serviceLogs by remember { ServiceEventLogStore.logs }.collectAsState()
     val activity = LocalActivity.current as? MainActivity
-    val lifecycleOwner = LocalLifecycleOwner.current
-    var hasUsageAccess by remember(activity) { mutableStateOf(activity?.hasUsageStatsAccess() ?: true) }
-    DisposableEffect(activity, lifecycleOwner) {
-        val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) {
-                hasUsageAccess = activity?.hasUsageStatsAccess() ?: true
-            }
-        }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
-    }
     KeyMapperContent(
         state = state,
         serviceLogs = serviceLogs,
-        usageAccessGranted = hasUsageAccess,
         onSetServiceEnabled = viewModel::setServiceEnabled,
         onRestoreStockKeys = viewModel::restoreStockKeys,
         onSetAction = { value, long, action -> viewModel.setAction(value, long, action) },
@@ -201,7 +170,6 @@ private fun KeyMapperScreen(viewModel: KeyMapperViewModel) {
         onSetServiceLogCaptureEnabled = ServiceEventLogStore::setCaptureEnabled,
         onClearServiceLog = ServiceEventLogStore::clear,
         onShareServiceLog = { activity?.shareServiceLog(ServiceEventLogStore.exportText()) },
-        onOpenUsageAccessSettings = { activity?.openUsageAccessSettings() },
     )
 }
 
@@ -209,7 +177,6 @@ private fun KeyMapperScreen(viewModel: KeyMapperViewModel) {
 private fun KeyMapperContent(
     state: MapperUiState,
     serviceLogs: List<ServiceLogEntry>,
-    usageAccessGranted: Boolean,
     onSetServiceEnabled: (Boolean) -> Unit,
     onRestoreStockKeys: () -> Unit,
     onSetAction: (Int, Boolean, KeyAction) -> Unit,
@@ -221,7 +188,6 @@ private fun KeyMapperContent(
     onSetServiceLogCaptureEnabled: (Boolean) -> Unit,
     onClearServiceLog: () -> Unit,
     onShareServiceLog: () -> Unit,
-    onOpenUsageAccessSettings: () -> Unit,
 ) {
     var showCrashDialog by remember { mutableStateOf(false) }
     var showServiceLogDialog by remember { mutableStateOf(false) }
@@ -306,38 +272,6 @@ private fun KeyMapperContent(
                                 ) {
                                     Text("Очистить")
                                 }
-                            }
-                        }
-                    }
-                }
-            }
-            if (!usageAccessGranted) {
-                item {
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = CardDefaults.cardColors(
-                            containerColor = HavalColorWarning.copy(alpha=0.3f),
-                            contentColor = MaterialTheme.colorScheme.onTertiaryContainer,
-                        ),
-                    ) {
-                        Column(
-                            Modifier
-                                .fillMaxWidth()
-                                .padding(12.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            Text(
-                                "Для определения активного приложения нужен доступ «Статистика использования».",
-                                style = MaterialTheme.typography.titleMedium,
-                            )
-                            Text(
-                                "Без этого foreground app в логе может быть unknown, и фильтрация по активному приложению не будет работать корректно."
-                            )
-                            Button(onClick = onOpenUsageAccessSettings, colors = ButtonDefaults.buttonColors(
-                                containerColor = MaterialTheme.colorScheme.tertiary,
-                                contentColor = MaterialTheme.colorScheme.onTertiary,
-                            )) {
-                                Text("Открыть настройки доступа")
                             }
                         }
                     }
@@ -725,7 +659,6 @@ private fun KeyMapperScreenPreview() {
                 ServiceLogEntry("12:00:00.100", "Кнопка MODE нажата: события нет"),
                 ServiceLogEntry("12:00:01.540", "Кнопка Громкость + (короткое): выполнено Медиа: следующий трек"),
             ),
-            usageAccessGranted = false,
             onSetServiceEnabled = {},
             onRestoreStockKeys = {},
             onSetAction = { _, _, _ -> },
@@ -737,7 +670,6 @@ private fun KeyMapperScreenPreview() {
             onSetServiceLogCaptureEnabled = {},
             onClearServiceLog = {},
             onShareServiceLog = {},
-            onOpenUsageAccessSettings = {},
         )
     }
 
@@ -752,7 +684,7 @@ private fun ServiceLogDialogPreview() {
                 ServiceLogEntry("12:00:00.100", "Service status updated"),
                 ServiceLogEntry(
                     "12:00:01.540",
-                    "Button MODE pressed; foreground app: ru.yandex.yandexmaps; no event (no remap)"
+                    "Button MODE pressed: no event (no remap)"
                 ),
                 ServiceLogEntry("12:00:03.220", "Button Volume+ (short press): executed MEDIA_NEXT"),
             ),

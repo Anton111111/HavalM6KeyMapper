@@ -5,10 +5,6 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
-import android.app.ActivityManager
-import android.app.AppOpsManager
-import android.app.usage.UsageStatsManager
-import android.annotation.SuppressLint
 import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
@@ -253,24 +249,23 @@ class KeyMapperService : Service() {
         val buttonTitle = catalog?.buttons?.firstOrNull { it.value == value }?.title
             ?: "0x${value.toString(16).uppercase()}"
         val statusName = packetStatusName(status)
-        val foregroundApp = detectForegroundAppPackage()
         ServiceEventLogStore.add(
-            "MCU packet 0x81/0x00: status=$statusName($status), button=$buttonTitle (0x${value.toString(16).uppercase()}), source=0x${source.toString(16).uppercase()}, foreground app: $foregroundApp"
+            "MCU packet 0x81/0x00: status=$statusName($status), button=$buttonTitle (0x${value.toString(16).uppercase()}), source=0x${source.toString(16).uppercase()}"
         )
         val rule = settings.rules[value]
         if (status == 1 || status == 0) {
             when {
                 rule == null || !rule.overridesStock() ->
                     ServiceEventLogStore.add(
-                        "Button $buttonTitle $statusName; foreground app: $foregroundApp; no event (no remap)"
+                        "Button $buttonTitle $statusName: no event (no remap)"
                     )
                 !filterApplied ->
                     ServiceEventLogStore.add(
-                        "Button $buttonTitle $statusName; foreground app: $foregroundApp; no event (remap inactive)"
+                        "Button $buttonTitle $statusName: no event (remap inactive)"
                     )
                 else ->
                     ServiceEventLogStore.add(
-                        "Button $buttonTitle $statusName; foreground app: $foregroundApp; waiting for gesture resolution"
+                        "Button $buttonTitle $statusName: waiting for gesture resolution"
                     )
             }
         }
@@ -454,43 +449,6 @@ class KeyMapperService : Service() {
         ServiceEventLogStore.add("Service status updated")
         getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit().putString(STATUS, message).apply()
         handler.post { notificationManager()?.notify(NOTIFICATION_ID, buildNotification(message)) }
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun detectForegroundAppPackage(): String {
-        val activityManager = getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
-        if (activityManager != null) {
-            val process = activityManager.runningAppProcesses
-                ?.filter {
-                    it.importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND ||
-                        it.importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_VISIBLE
-                }
-                ?.minByOrNull { it.importance }
-            if (process != null) {
-                val packageName = process.pkgList.firstOrNull { it.isNotBlank() } ?: process.processName
-                if (!packageName.isNullOrBlank()) return packageName
-            }
-        }
-        if (!hasUsageStatsAccess()) return "unknown(no usage access)"
-        val usageManager = getSystemService(UsageStatsManager::class.java)
-            ?: return "unknown(no foreground process)"
-        val end = System.currentTimeMillis()
-        val begin = end - 15_000L
-        val packageName = usageManager
-            .queryUsageStats(UsageStatsManager.INTERVAL_DAILY, begin, end)
-            .maxByOrNull { it.lastTimeUsed }
-            ?.packageName
-        return packageName?.takeIf { it.isNotBlank() } ?: "unknown(no foreground process)"
-    }
-
-    private fun hasUsageStatsAccess(): Boolean {
-        val appOps = getSystemService(Context.APP_OPS_SERVICE) as? AppOpsManager ?: return false
-        val mode = appOps.checkOpNoThrow(
-            AppOpsManager.OPSTR_GET_USAGE_STATS,
-            android.os.Process.myUid(),
-            packageName,
-        )
-        return mode == AppOpsManager.MODE_ALLOWED
     }
 
     private fun packetStatusName(status: Int): String = when (status) {
