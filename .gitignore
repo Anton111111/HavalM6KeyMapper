@@ -2,3 +2,16 @@
 **/build/
 local.properties
 *.iml
+/.idea/caches/deviceStreaming.xml
+/.idea/inspectionProfiles/Project_Default.xml
+/.idea/.gitignore
+/.idea/AndroidProjectSystem.xml
+/.idea/assetWizardSettings.xml
+/.idea/compiler.xml
+/.idea/deploymentTargetSelector.xml
+/.idea/gradle.xml
+/.idea/markdown.xml
+/.idea/migrations.xml
+/.idea/misc.xml
+/.idea/runConfigurations.xml
+/.idea/vcs.xml
