@@ -119,6 +119,8 @@ data class MapperUiState(
     val loading: Boolean = true,
 )
 
+val SINGLE_EVENT_BUTTON_KEYS = setOf(0x12, 0x13)
+
 internal fun encodeRules(rules: Map<Int, ButtonRule>): String {
     val array = JSONArray()
     rules.toSortedMap().forEach { (value, rule) ->

@@ -5,6 +5,9 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.app.ActivityManager
+import android.app.usage.UsageStatsManager
+import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -245,15 +248,37 @@ class KeyMapperService : Service() {
     }
 
     private fun onButtonPacket(status: Int, value: Int, source: Int) {
-        if (!filterApplied) return
-        val rule = settings.rules[value] ?: return
-        if (!rule.overridesStock()) return
+        val buttonTitle = catalog?.buttons?.firstOrNull { it.value == value }?.title
+            ?: "0x${value.toString(16).uppercase()}"
+        val statusName = packetStatusName(status)
+        val foregroundApp = detectForegroundAppPackage()
+        ServiceEventLogStore.add(
+            "MCU packet 0x81/0x00: status=$statusName($status), button=$buttonTitle (0x${value.toString(16).uppercase()}), source=0x${source.toString(16).uppercase()}, foreground app: $foregroundApp"
+        )
+        val rule = settings.rules[value]
+        if (status == 1 || status == 0) {
+            when {
+                rule == null || !rule.overridesStock() ->
+                    ServiceEventLogStore.add(
+                        "Button $buttonTitle $statusName; foreground app: $foregroundApp; no event (no remap)"
+                    )
+                !filterApplied ->
+                    ServiceEventLogStore.add(
+                        "Button $buttonTitle $statusName; foreground app: $foregroundApp; no event (remap inactive)"
+                    )
+                else ->
+                    ServiceEventLogStore.add(
+                        "Button $buttonTitle $statusName; foreground app: $foregroundApp; waiting for gesture resolution"
+                    )
+            }
+        }
+        if (!filterApplied || rule == null || !rule.overridesStock()) return
         val id = source * 256 + value
         val now = android.os.SystemClock.elapsedRealtime()
         when (status) {
             0 -> {
                 presses.remove(id)?.timeout?.let(handler::removeCallbacks)
-                executeGesture(rule, false)
+                executeGesture(rule, false, buttonTitle)
             }
             1 -> {
                 if (presses[id] == null) {
@@ -262,7 +287,7 @@ class KeyMapperService : Service() {
                         val current = presses[id]
                         if (current === press && !current.longSent) {
                             current.longSent = true
-                            executeGesture(rule, true)
+                            executeGesture(rule, true, buttonTitle)
                         }
                     }
                     presses[id] = press
@@ -272,22 +297,29 @@ class KeyMapperService : Service() {
             2 -> {
                 val press = presses.remove(id) ?: return
                 press.timeout?.let(handler::removeCallbacks)
-                if (!press.longSent) executeGesture(rule, now - press.startedAt >= LONG_PRESS_MS)
+                if (!press.longSent) executeGesture(rule, now - press.startedAt >= LONG_PRESS_MS, buttonTitle)
             }
             3 -> {
                 val press = presses.getOrPut(id) { PressState() }
                 press.timeout?.let(handler::removeCallbacks)
                 if (!press.longSent) {
                     press.longSent = true
-                    executeGesture(rule, true)
+                    executeGesture(rule, true, buttonTitle)
                 }
+            }
+            else -> {
+                ServiceEventLogStore.add("Button $buttonTitle: unsupported packet status $status")
             }
         }
     }
 
-    private fun executeGesture(rule: ButtonRule, longPress: Boolean) {
+    private fun executeGesture(rule: ButtonRule, longPress: Boolean, buttonTitle: String) {
         val action = rule.action(longPress)
-        if (action == KeyAction.DEFAULT || action == KeyAction.DISABLE) return
+        val pressType = if (longPress) "long press" else "short press"
+        if (action == KeyAction.DEFAULT || action == KeyAction.DISABLE) {
+            ServiceEventLogStore.add("Button $buttonTitle ($pressType): no event")
+            return
+        }
         worker.execute {
             try {
                 when (action) {
@@ -313,10 +345,14 @@ class KeyMapperService : Service() {
                     KeyAction.APP_LAUNCH -> launchApp(requireSelectedApp(rule, longPress, action))
                     KeyAction.DEFAULT, KeyAction.DISABLE -> Unit
                 }
+                ServiceEventLogStore.add("Button $buttonTitle ($pressType): executed ${action.name}")
                 setStatus("Выполнено: ${action.title}")
             } catch (exception: Throwable) {
                 Log.e(TAG, "Failed executing ${action.name}", exception)
                 rememberFailure("Ошибка действия «${action.title}»", exception)
+                ServiceEventLogStore.add(
+                    "Button $buttonTitle ($pressType): action ${action.name} failed: ${exception.message}"
+                )
                 setStatus("Ошибка действия «${action.title}»: ${exception.message}")
             }
         }
@@ -338,23 +374,47 @@ class KeyMapperService : Service() {
     }
 
     private fun dispatchMediaAction(action: MediaAction) {
-        dispatchMediaButton(action.keyCode)
+        val keyCode = action.keyCode
+        val keyName = KeyEvent.keyCodeToString(keyCode)
+        val receivers = packageManager.queryBroadcastReceivers(Intent(Intent.ACTION_MEDIA_BUTTON), 0)
+        val receiverPackages = receivers
+            .mapNotNull { it.activityInfo?.packageName ?: it.resolvePackageName }
+            .distinct()
+        val receiverPreview = receiverPackages.take(4).joinToString()
+        ServiceEventLogStore.add(
+            "Media action ${action.name}: key=$keyName($keyCode), receivers=${receiverPackages.size}" +
+                if (receiverPreview.isBlank()) "" else ", top=$receiverPreview"
+        )
+        if (receiverPackages.isEmpty()) {
+            ServiceEventLogStore.add("Media action ${action.name}: no ACTION_MEDIA_BUTTON receivers")
+        }
+        dispatchMediaButton(keyCode, KeyEvent.ACTION_DOWN)
+        dispatchMediaButton(keyCode, KeyEvent.ACTION_UP)
     }
 
-    private fun dispatchMediaButton(keyCode: Int) {
-        sendOrderedBroadcast(
-            Intent(Intent.ACTION_MEDIA_BUTTON).putExtra(
-                Intent.EXTRA_KEY_EVENT,
-                KeyEvent(KeyEvent.ACTION_DOWN, keyCode)
-            ),
-            null
+    private fun dispatchMediaButton(keyCode: Int, eventAction: Int) {
+        val phase = if (eventAction == KeyEvent.ACTION_DOWN) "DOWN" else "UP"
+        val mediaIntent = Intent(Intent.ACTION_MEDIA_BUTTON).putExtra(
+            Intent.EXTRA_KEY_EVENT,
+            KeyEvent(eventAction, keyCode)
         )
         sendOrderedBroadcast(
-            Intent(Intent.ACTION_MEDIA_BUTTON).putExtra(
-                Intent.EXTRA_KEY_EVENT,
-                KeyEvent(KeyEvent.ACTION_UP, keyCode)
-            ),
-            null
+            mediaIntent,
+            null,
+            object : BroadcastReceiver() {
+                override fun onReceive(context: Context?, intent: Intent?) {
+                    val data = resultData ?: "null"
+                    val extras = getResultExtras(false)
+                    val extraKeys = extras?.keySet()?.take(4)?.joinToString() ?: "none"
+                    ServiceEventLogStore.add(
+                        "Media key $phase finished: resultCode=$resultCode, resultData=$data, extras=$extraKeys"
+                    )
+                }
+            },
+            handler,
+            0,
+            null,
+            null,
         )
     }
 
@@ -389,8 +449,42 @@ class KeyMapperService : Service() {
     }
 
     private fun setStatus(message: String) {
+        ServiceEventLogStore.add("Service status updated")
         getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit().putString(STATUS, message).apply()
         handler.post { notificationManager()?.notify(NOTIFICATION_ID, buildNotification(message)) }
+    }
+
+    private fun detectForegroundAppPackage(): String {
+        val activityManager = getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+        if (activityManager != null) {
+            val process = activityManager.runningAppProcesses
+                ?.filter {
+                    it.importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND ||
+                        it.importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_VISIBLE
+                }
+                ?.minByOrNull { it.importance }
+            if (process != null) {
+                val packageName = process.pkgList.firstOrNull { it.isNotBlank() } ?: process.processName
+                if (!packageName.isNullOrBlank()) return packageName
+            }
+        }
+        val usageManager = getSystemService(UsageStatsManager::class.java)
+            ?: return "unknown(no foreground process)"
+        val end = System.currentTimeMillis()
+        val begin = end - 15_000L
+        val packageName = usageManager
+            .queryUsageStats(UsageStatsManager.INTERVAL_DAILY, begin, end)
+            .maxByOrNull { it.lastTimeUsed }
+            ?.packageName
+        return packageName?.takeIf { it.isNotBlank() } ?: "unknown(no foreground process)"
+    }
+
+    private fun packetStatusName(status: Int): String = when (status) {
+        0 -> "SINGLE"
+        1 -> "DOWN"
+        2 -> "UP"
+        3 -> "LONG_PRESS"
+        else -> "UNKNOWN"
     }
 
     private fun rememberFailure(contextMessage: String, throwable: Throwable) {

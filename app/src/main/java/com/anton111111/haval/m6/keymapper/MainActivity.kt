@@ -21,6 +21,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material.icons.filled.ViewTimeline
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -29,13 +30,16 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -51,6 +55,8 @@ import androidx.compose.ui.text.withLink
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.anton111111.haval.m6.keymapper.data.ButtonDefinition
 import com.anton111111.haval.m6.keymapper.data.ButtonRule
@@ -58,7 +64,10 @@ import com.anton111111.haval.m6.keymapper.data.KeyAction
 import com.anton111111.haval.m6.keymapper.data.KeyMapperViewModel
 import com.anton111111.haval.m6.keymapper.data.LaunchableApp
 import com.anton111111.haval.m6.keymapper.data.MapperUiState
+import com.anton111111.haval.m6.keymapper.data.SINGLE_EVENT_BUTTON_KEYS
 import com.anton111111.haval.m6.keymapper.data.requiresAppSelection
+import com.anton111111.haval.m6.keymapper.service.ServiceEventLogStore
+import com.anton111111.haval.m6.keymapper.service.ServiceLogEntry
 
 class MainActivity : ComponentActivity() {
     private var crashForSave: String? = null
@@ -117,14 +126,32 @@ class MainActivity : ComponentActivity() {
         crashForSave = crash
         saveCrashLauncher.launch("haval-key-mapper-crash.txt")
     }
+
+    fun shareServiceLog(logText: String) {
+        val file = java.io.File(cacheDir, "haval-key-mapper-service-log.txt")
+        file.writeText(logText, Charsets.UTF_8)
+        val uri = androidx.core.content.FileProvider.getUriForFile(
+            this,
+            "$packageName.fileprovider",
+            file,
+        )
+        val share = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        startActivity(Intent.createChooser(share, "Поделиться логом сервиса"))
+    }
 }
 
 @Composable
 private fun KeyMapperScreen(viewModel: KeyMapperViewModel) {
     val state by viewModel.state.collectAsState()
+    val serviceLogs by remember { ServiceEventLogStore.logs }.collectAsState()
     val activity = LocalActivity.current as? MainActivity
     KeyMapperContent(
         state = state,
+        serviceLogs = serviceLogs,
         onSetServiceEnabled = viewModel::setServiceEnabled,
         onRestoreStockKeys = viewModel::restoreStockKeys,
         onSetAction = { value, long, action -> viewModel.setAction(value, long, action) },
@@ -139,12 +166,16 @@ private fun KeyMapperScreen(viewModel: KeyMapperViewModel) {
         onClearLastCrash = viewModel::clearLastCrash,
         onShareCrash = { crash -> activity?.shareCrash(crash) },
         onSaveCrash = { crash -> activity?.saveCrash(crash) },
+        onSetServiceLogCaptureEnabled = ServiceEventLogStore::setCaptureEnabled,
+        onClearServiceLog = ServiceEventLogStore::clear,
+        onShareServiceLog = { activity?.shareServiceLog(ServiceEventLogStore.exportText()) },
     )
 }
 
 @Composable
 private fun KeyMapperContent(
     state: MapperUiState,
+    serviceLogs: List<ServiceLogEntry>,
     onSetServiceEnabled: (Boolean) -> Unit,
     onRestoreStockKeys: () -> Unit,
     onSetAction: (Int, Boolean, KeyAction) -> Unit,
@@ -153,8 +184,16 @@ private fun KeyMapperContent(
     onClearLastCrash: () -> Unit,
     onShareCrash: (String) -> Unit,
     onSaveCrash: (String) -> Unit,
+    onSetServiceLogCaptureEnabled: (Boolean) -> Unit,
+    onClearServiceLog: () -> Unit,
+    onShareServiceLog: () -> Unit,
 ) {
     var showCrashDialog by remember { mutableStateOf(false) }
+    var showServiceLogDialog by remember { mutableStateOf(false) }
+    DisposableEffect(showServiceLogDialog) {
+        onSetServiceLogCaptureEnabled(showServiceLogDialog)
+        onDispose { onSetServiceLogCaptureEnabled(false) }
+    }
     Scaffold { padding ->
         LazyColumn(
             modifier = Modifier
@@ -170,11 +209,22 @@ private fun KeyMapperContent(
                 AuthorInfoBlock()
             }
             item {
-                Text(
-                    color = HavalColorSuccess,
-                    text = state.status,
-                    style = MaterialTheme.typography.headlineSmall
-                )
+                Row {
+                    Text(
+                        modifier = Modifier.weight(1f),
+                        color = HavalColorSuccess,
+                        text = state.status,
+                        style = MaterialTheme.typography.headlineSmall
+                    )
+                    IconButton(
+                        onClick = { showServiceLogDialog = true },
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.ViewTimeline,
+                            contentDescription = null
+                        )
+                    }
+                }
             }
             state.error?.let { error ->
                 item {
@@ -295,6 +345,58 @@ private fun KeyMapperContent(
             )
         }
     }
+
+    if (showServiceLogDialog) {
+        ServiceLogDialog(
+            logs = serviceLogs,
+            onClear = onClearServiceLog,
+            onShare = onShareServiceLog,
+            onClose = { showServiceLogDialog = false },
+        )
+    }
+}
+
+@Composable
+private fun ServiceLogDialog(
+    logs: List<ServiceLogEntry>,
+    onClear: () -> Unit,
+    onShare: () -> Unit,
+    onClose: () -> Unit,
+) {
+    Dialog(
+        onDismissRequest = onClose,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Surface(modifier = Modifier.fillMaxSize()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Button(onClick = onClear) { Text("Очистить") }
+                    Button(onClick = onShare) { Text("Поделиться") }
+                    OutlinedButton(onClick = onClose) { Text("Закрыть") }
+                }
+                if (logs.isEmpty()) {
+                    Text("Лог пока пуст")
+                } else {
+                    LazyColumn(
+                        modifier = Modifier.fillMaxSize(),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        items(logs) { entry ->
+                            Text("[${entry.timestamp}] ${entry.event}")
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 @Composable
@@ -307,6 +409,7 @@ private fun ButtonCard(
     onReset: () -> Unit,
 ) {
     val hasOverride = rule.overridesStock()
+    val supportsLongPress = button.value !in SINGLE_EVENT_BUTTON_KEYS
     Card(
         Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(
@@ -349,7 +452,12 @@ private fun ButtonCard(
 
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 ActionDropdown("Короткое:", rule.shortAction) { onAction(false, it) }
-                ActionDropdown("Длинное:", rule.longAction) { onAction(true, it) }
+                if (supportsLongPress) {
+                    ActionDropdown("Длинное:", rule.longAction) { onAction(true, it) }
+                }
+            }
+            if (!supportsLongPress) {
+                Text("Для этой кнопки доступно только SINGLE-событие")
             }
             if (rule.shortAction.requiresAppSelection()) {
                 AppDropdown(
@@ -359,7 +467,7 @@ private fun ButtonCard(
                     onSelected = { onActionTargetApp(false, it) },
                 )
             }
-            if (rule.longAction.requiresAppSelection()) {
+            if (supportsLongPress && rule.longAction.requiresAppSelection()) {
                 AppDropdown(
                     label = "Приложение для длинного",
                     selectedPackage = rule.longAppPackage,
@@ -505,6 +613,7 @@ private fun KeyMapperScreenPreview() {
         ButtonDefinition(0x51, "KEY_VOL_UP", "Громкость +"),
         ButtonDefinition(0x52, "KEY_VOL_DOWN", "Громкость -"),
         ButtonDefinition(0x21, "KEY_MODE", "MODE"),
+        ButtonDefinition(0x13, "K_KNOB_UP", "Крутилка +"),
     )
     val previewRules = mapOf(
         0x51 to ButtonRule(
@@ -518,6 +627,11 @@ private fun KeyMapperScreenPreview() {
             value = 0x52,
             shortAction = KeyAction.MEDIA_PREVIOUS,
             longAction = KeyAction.DISABLE
+        ),
+        0x13 to ButtonRule(
+            value = 0x13,
+            shortAction = KeyAction.MEDIA_NEXT,
+            longAction = KeyAction.DEFAULT,
         ),
     )
     val previewApps = listOf(
@@ -540,6 +654,10 @@ private fun KeyMapperScreenPreview() {
     HavalM6Theme {
         KeyMapperContent(
             state = previewState,
+            serviceLogs = listOf(
+                ServiceLogEntry("12:00:00.100", "Кнопка MODE нажата: события нет"),
+                ServiceLogEntry("12:00:01.540", "Кнопка Громкость + (короткое): выполнено Медиа: следующий трек"),
+            ),
             onSetServiceEnabled = {},
             onRestoreStockKeys = {},
             onSetAction = { _, _, _ -> },
@@ -548,6 +666,30 @@ private fun KeyMapperScreenPreview() {
             onClearLastCrash = {},
             onShareCrash = {},
             onSaveCrash = {},
+            onSetServiceLogCaptureEnabled = {},
+            onClearServiceLog = {},
+            onShareServiceLog = {},
+        )
+    }
+
+}
+
+@Preview(name = "Service log dialog", showBackground = true, widthDp = 960, heightDp = 540)
+@Composable
+private fun ServiceLogDialogPreview() {
+    HavalM6Theme {
+        ServiceLogDialog(
+            logs = listOf(
+                ServiceLogEntry("12:00:00.100", "Service status updated"),
+                ServiceLogEntry(
+                    "12:00:01.540",
+                    "Button MODE pressed; foreground app: ru.yandex.yandexmaps; no event (no remap)"
+                ),
+                ServiceLogEntry("12:00:03.220", "Button Volume+ (short press): executed MEDIA_NEXT"),
+            ),
+            onClear = {},
+            onShare = {},
+            onClose = {},
         )
     }
 }

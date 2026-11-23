@@ -146,7 +146,7 @@ class KeyMapperViewModel(application: Application) : AndroidViewModel(applicatio
         val DEFAULT_WHEEL_KEYS = setOf(
             0x05, 0x06, 0x21,
             0x60, 0x61, 0x62, 0x63, 0x78, 0x79,
-        )
+        ) + SINGLE_EVENT_BUTTON_KEYS
 
         val HIDDEN_BUTTON_KEYS = setOf(
             0x09, 0x0A,
