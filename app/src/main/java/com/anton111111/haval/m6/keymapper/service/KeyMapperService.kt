@@ -6,7 +6,9 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.app.ActivityManager
+import android.app.AppOpsManager
 import android.app.usage.UsageStatsManager
+import android.annotation.SuppressLint
 import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
@@ -454,6 +456,7 @@ class KeyMapperService : Service() {
         handler.post { notificationManager()?.notify(NOTIFICATION_ID, buildNotification(message)) }
     }
 
+    @SuppressLint("MissingPermission")
     private fun detectForegroundAppPackage(): String {
         val activityManager = getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
         if (activityManager != null) {
@@ -468,6 +471,7 @@ class KeyMapperService : Service() {
                 if (!packageName.isNullOrBlank()) return packageName
             }
         }
+        if (!hasUsageStatsAccess()) return "unknown(no usage access)"
         val usageManager = getSystemService(UsageStatsManager::class.java)
             ?: return "unknown(no foreground process)"
         val end = System.currentTimeMillis()
@@ -477,6 +481,16 @@ class KeyMapperService : Service() {
             .maxByOrNull { it.lastTimeUsed }
             ?.packageName
         return packageName?.takeIf { it.isNotBlank() } ?: "unknown(no foreground process)"
+    }
+
+    private fun hasUsageStatsAccess(): Boolean {
+        val appOps = getSystemService(Context.APP_OPS_SERVICE) as? AppOpsManager ?: return false
+        val mode = appOps.checkOpNoThrow(
+            AppOpsManager.OPSTR_GET_USAGE_STATS,
+            android.os.Process.myUid(),
+            packageName,
+        )
+        return mode == AppOpsManager.MODE_ALLOWED
     }
 
     private fun packetStatusName(status: Int): String = when (status) {
